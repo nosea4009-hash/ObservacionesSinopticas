@@ -38,6 +38,12 @@ from metpy.calc import wind_components, dewpoint_from_relative_humidity
 from metpy.plots import StationPlot, current_weather, sky_cover
 from metpy.units import units
 from metpy.calc import reduce_point_density
+from metpy.interpolate import interpolate_to_grid, remove_nan_observations
+
+
+# URL oficial del SMN: "Tiempo Presente" (observaciones de superficie actuales).
+# Devuelve un ZIP con un archivo estado_tiempo<AAAAMMDD>.txt
+SMN_TIEMPO_PRESENTE_URL = "https://ssl.smn.gob.ar/dpd/zipopendata.php?dato=tiepre"
 
 
 # --------------------------------------------------------------------------- #
@@ -333,10 +339,72 @@ def f_mslp(v):
 
 
 # --------------------------------------------------------------------------- #
+# Isobaras (presion reducida a nivel del mar, interpolada a una grilla)
+# --------------------------------------------------------------------------- #
+def add_isobars(ax, df, transform, step: float = 2.0, color="#1f4ed8"):
+    """Dibuja isobaras a partir de la MSLP de las estaciones.
+
+    Interpola la presion (vecino natural) a una grilla y traza contornos
+    cada `step` hPa. Usa TODAS las estaciones con presion (no solo las del
+    recuadro) para que el campo quede bien condicionado en los bordes.
+    """
+    sub = df.dropna(subset=["mslp"])
+    if len(sub) < 4:
+        print("[aviso] muy pocas estaciones con presion: no se dibujan isobaras")
+        return None
+
+    lon, lat, mslp = remove_nan_observations(
+        sub["lon"].to_numpy(), sub["lat"].to_numpy(), sub["mslp"].to_numpy())
+    try:
+        gx, gy, gz = interpolate_to_grid(
+            lon, lat, mslp, interp_type="natural_neighbor", hres=0.25)
+    except Exception as exc:  # pragma: no cover
+        print(f"[aviso] no se pudieron interpolar las isobaras: {exc}")
+        return None
+
+    lo = np.floor(np.nanmin(gz) / step) * step
+    hi = np.ceil(np.nanmax(gz) / step) * step
+    levels = np.arange(lo, hi + step, step)
+
+    cs = ax.contour(gx, gy, gz, levels=levels, colors=color,
+                    linewidths=0.9, alpha=0.85, transform=transform, zorder=1)
+    ax.clabel(cs, inline=True, fmt="%d", fontsize=7)
+    return cs
+
+
+# --------------------------------------------------------------------------- #
+# Descarga de datos actuales del SMN (Tiempo Presente)
+# --------------------------------------------------------------------------- #
+def download_latest_smn(dest_dir: str = ".") -> str:
+    """Descarga el archivo de observaciones mas reciente del SMN y lo guarda.
+
+    Devuelve la ruta al .txt extraido (estado_tiempo<AAAAMMDD>.txt).
+    """
+    import io
+    import urllib.request
+    import zipfile
+
+    print(f"[info] descargando datos actuales del SMN: {SMN_TIEMPO_PRESENTE_URL}")
+    req = urllib.request.Request(
+        SMN_TIEMPO_PRESENTE_URL, headers={"User-Agent": "Mozilla/5.0"})
+    with urllib.request.urlopen(req, timeout=60) as resp:
+        blob = resp.read()
+
+    zf = zipfile.ZipFile(io.BytesIO(blob))
+    name = zf.namelist()[0]
+    out_path = os.path.join(dest_dir, os.path.basename(name))
+    with open(out_path, "wb") as fh:
+        fh.write(zf.read(name))
+    print(f"[ok] datos guardados en {out_path}")
+    return out_path
+
+
+# --------------------------------------------------------------------------- #
 # Ploteo
 # --------------------------------------------------------------------------- #
 def make_plot(df: pd.DataFrame, extent, datetime_str: str, out_path: str,
-              density_deg: float = 0.5):
+              density_deg: float = 0.5, isobaras: bool = False,
+              iso_step: float = 2.0):
     proj = ccrs.PlateCarree()
 
     fig = plt.figure(figsize=(13, 10))
@@ -368,6 +436,10 @@ def make_plot(df: pd.DataFrame, extent, datetime_str: str, out_path: str,
     # recuadro negro del plot
     ax.spines["geo"].set_edgecolor("black")
     ax.spines["geo"].set_linewidth(1.0)
+
+    # --- isobaras (opcional) ---
+    if isobaras:
+        add_isobars(ax, df, proj, step=iso_step)
 
     # --- declutter: reduce densidad de puntos ---
     if len(df):
@@ -423,6 +495,14 @@ def main():
     ap.add_argument("--stations", default="estaciones_smn.txt")
     ap.add_argument("--weather", default=None,
                     help="archivo estado_tiempo*.txt (por defecto el mas reciente)")
+    ap.add_argument("--actualizar", action="store_true",
+                    help="descarga del SMN el archivo de observaciones mas reciente "
+                         "(Tiempo Presente) antes de plotear")
+    ap.add_argument("--isobaras", action=argparse.BooleanOptionalAction, default=False,
+                    help="dibuja isobaras de presion al nivel del mar "
+                         "(usar --isobaras para activarlas, --no-isobaras para no)")
+    ap.add_argument("--paso-isobaras", dest="paso_isobaras", type=float, default=2.0,
+                    help="intervalo entre isobaras en hPa (por defecto 2)")
     ap.add_argument("--region", choices=list(REGIONS), default=None,
                     help="region predefinida (ver lista abajo). Tiene prioridad sobre --extent")
     ap.add_argument("--extent", nargs=4, type=float, default=None,
@@ -457,23 +537,28 @@ def main():
         density = max(0.08, round(lon_span / 48.0, 2))
 
     weather_path = args.weather
-    if weather_path is None:
+    if args.actualizar:
+        weather_path = download_latest_smn(".")
+    elif weather_path is None:
         cands = sorted(glob.glob("estado_tiempo*.txt"))
         if not cands:
-            raise SystemExit("No se encontro ningun archivo estado_tiempo*.txt")
+            raise SystemExit("No se encontro ningun archivo estado_tiempo*.txt. "
+                             "Usa --actualizar para descargarlo del SMN.")
         weather_path = cands[-1]
 
     stations = parse_stations(args.stations)
     weather = parse_weather(weather_path)
     print(f"[info] {len(stations)} estaciones en catalogo, "
           f"{len(weather)} observaciones en {weather_path}")
-    print(f"[info] region={region_name}  extent={extent}  density={density}")
+    print(f"[info] region={region_name}  extent={extent}  density={density}  "
+          f"isobaras={args.isobaras}")
 
     df = build_dataframe(weather, stations)
 
     dt = args.datetime or derive_datetime(weather_path, weather)
     out = args.out or f"observaciones_{region_name}_{dt}.png"
-    make_plot(df, tuple(extent), dt, out, density_deg=density)
+    make_plot(df, tuple(extent), dt, out, density_deg=density,
+              isobaras=args.isobaras, iso_step=args.paso_isobaras)
 
 
 if __name__ == "__main__":
