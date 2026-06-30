@@ -1,0 +1,7 @@
+# Station plot METAR / observacion sinoptica de superficie
+# Probado con Python 3.11
+metpy==1.7.1
+matplotlib==3.9.2   # MetPy 1.7.1 aun no es compatible con matplotlib 3.10/3.11
+cartopy==0.25.0
+pandas
+numpy
