@@ -306,7 +306,7 @@ def build_dataframe(weather: pd.DataFrame, stations: pd.DataFrame,
             u, v = float(u_q.m), float(v_q.m)
 
         records.append(dict(
-            nombre=st["nombre"], lat=st["lat"], lon=st["lon"],
+            nombre=st["nombre"], lat=st["lat"], lon=st["lon"], alt=st["alt"],
             tair=temp, dewp=dew, mslp=mslp, u=u, v=v,
             oktas=int(obs["oktas"]), ww=int(obs["ww"]),
         ))
@@ -339,37 +339,99 @@ def f_mslp(v):
 
 
 # --------------------------------------------------------------------------- #
-# Isobaras (presion reducida a nivel del mar, interpolada a una grilla)
+# Campo de presion: grilla, isobaras y centros de Alta/Baja
 # --------------------------------------------------------------------------- #
-def add_isobars(ax, df, transform, step: float = 2.0, color="#1f4ed8"):
-    """Dibuja isobaras a partir de la MSLP de las estaciones.
+def compute_mslp_grid(df, extent, hres: float = 0.25, max_alt: float = 1200.0,
+                      search_radius: float = 4.0):
+    """Interpola la MSLP de las estaciones a una grilla que cubre el recuadro.
 
-    Interpola la presion (vecino natural) a una grilla y traza contornos
-    cada `step` hPa. Usa TODAS las estaciones con presion (no solo las del
-    recuadro) para que el campo quede bien condicionado en los bordes.
+    Usa interpolacion de Cressman con radio de busqueda: el campo se extiende
+    varios grados mas alla de las estaciones (por eso las isobaras CRUZAN la
+    frontera de Argentina hacia Brasil/Uruguay/oceano), pero queda acotado a
+    valores fisicos (promedio ponderado de los datos), sin la extrapolacion
+    descontrolada de RBF. Mas alla del radio el campo es NaN (no se dibuja).
+
+    Descarta estaciones de gran altura (> max_alt m), cuya reduccion a nivel
+    del mar es poco confiable y ensucia el campo de presion.
     """
     sub = df.dropna(subset=["mslp"])
+    if "alt" in sub:
+        sub = sub[sub["alt"] <= max_alt]
     if len(sub) < 4:
-        print("[aviso] muy pocas estaciones con presion: no se dibujan isobaras")
+        print("[aviso] muy pocas estaciones con presion: no hay campo de presion")
         return None
 
     lon, lat, mslp = remove_nan_observations(
         sub["lon"].to_numpy(), sub["lat"].to_numpy(), sub["mslp"].to_numpy())
+
+    margin = 1.0  # para que las isobaras lleguen a los bordes del recuadro
+    bounds = {"west": extent[0] - margin, "east": extent[1] + margin,
+              "south": extent[2] - margin, "north": extent[3] + margin}
     try:
         gx, gy, gz = interpolate_to_grid(
-            lon, lat, mslp, interp_type="natural_neighbor", hres=0.25)
+            lon, lat, mslp, interp_type="cressman", hres=hres,
+            search_radius=search_radius, minimum_neighbors=1,
+            boundary_coords=bounds)
     except Exception as exc:  # pragma: no cover
-        print(f"[aviso] no se pudieron interpolar las isobaras: {exc}")
+        print(f"[aviso] no se pudo interpolar el campo de presion: {exc}")
         return None
+    return gx, gy, gz
 
+
+def add_isobars(ax, gx, gy, gz, transform, step: float = 2.0, color="#1f4ed8"):
     lo = np.floor(np.nanmin(gz) / step) * step
     hi = np.ceil(np.nanmax(gz) / step) * step
     levels = np.arange(lo, hi + step, step)
-
     cs = ax.contour(gx, gy, gz, levels=levels, colors=color,
                     linewidths=0.9, alpha=0.85, transform=transform, zorder=1)
     ax.clabel(cs, inline=True, fmt="%d", fontsize=7)
     return cs
+
+
+def mark_pressure_centers(ax, gx, gy, gz, transform,
+                          neighborhood_deg: float = 5.0, hres: float = 0.25):
+    """Marca centros de Alta (A, azul) y Baja (B, rojo) presion.
+
+    Detecta maximos y minimos locales del campo con filtros de vecindad
+    (scipy.ndimage), rotulandolos con la letra y el valor en hPa. Para evitar
+    falsos centros: (1) ignora celdas NaN y las pegadas al borde de la zona con
+    datos (su entorno cercano debe tener datos), y (2) agrupa extremos muy
+    cercanos en uno solo.
+    """
+    from scipy.ndimage import maximum_filter, minimum_filter
+
+    size = max(5, int(round(neighborhood_deg / hres)))
+    valid = ~np.isnan(gz)
+    if valid.sum() < size * size:
+        return
+    filled = np.where(valid, gz, np.nanmean(gz))
+
+    # el entorno cercano (~mitad de la vecindad) debe tener datos reales
+    core_size = max(3, size // 2)
+    core = minimum_filter(valid.astype(np.int8), size=core_size,
+                          mode="constant", cval=0) == 1
+    gz_max = maximum_filter(filled, size=size, mode="nearest")
+    gz_min = minimum_filter(filled, size=size, mode="nearest")
+
+    min_sep = neighborhood_deg * 0.6
+
+    def _draw(mask, letra, color):
+        placed = []
+        for i, j in zip(*np.where(mask & core)):
+            x, y, val = gx[i, j], gy[i, j], gz[i, j]
+            if any(abs(x - px) < min_sep and abs(y - py) < min_sep
+                   for px, py in placed):
+                continue
+            placed.append((x, y))
+            ax.text(x, y, letra, transform=transform, color=color, fontsize=20,
+                    fontweight="bold", ha="center", va="center", zorder=6,
+                    clip_on=True)
+            ax.text(x, y - 0.5, f"{int(round(val))}", transform=transform,
+                    color=color, fontsize=8, ha="center", va="center", zorder=6,
+                    clip_on=True)
+
+    _draw(filled == gz_max, "A", "blue")
+    _draw(filled == gz_min, "B", "red")
 
 
 # --------------------------------------------------------------------------- #
@@ -404,7 +466,7 @@ def download_latest_smn(dest_dir: str = ".") -> str:
 # --------------------------------------------------------------------------- #
 def make_plot(df: pd.DataFrame, extent, datetime_str: str, out_path: str,
               density_deg: float = 0.5, isobaras: bool = False,
-              iso_step: float = 2.0):
+              iso_step: float = 2.0, centros: bool = False):
     proj = ccrs.PlateCarree()
 
     fig = plt.figure(figsize=(13, 10))
@@ -437,9 +499,16 @@ def make_plot(df: pd.DataFrame, extent, datetime_str: str, out_path: str,
     ax.spines["geo"].set_edgecolor("black")
     ax.spines["geo"].set_linewidth(1.0)
 
-    # --- isobaras (opcional) ---
-    if isobaras:
-        add_isobars(ax, df, proj, step=iso_step)
+    # --- campo de presion: isobaras y/o centros A/B (opcional) ---
+    if isobaras or centros:
+        hres = 0.25
+        grid = compute_mslp_grid(df, extent, hres=hres)
+        if grid is not None:
+            gx, gy, gz = grid
+            if isobaras:
+                add_isobars(ax, gx, gy, gz, proj, step=iso_step)
+            if centros:
+                mark_pressure_centers(ax, gx, gy, gz, proj, hres=hres)
 
     # --- declutter: reduce densidad de puntos ---
     if len(df):
@@ -503,6 +572,9 @@ def main():
                          "(usar --isobaras para activarlas, --no-isobaras para no)")
     ap.add_argument("--paso-isobaras", dest="paso_isobaras", type=float, default=2.0,
                     help="intervalo entre isobaras en hPa (por defecto 2)")
+    ap.add_argument("--centros", action=argparse.BooleanOptionalAction, default=False,
+                    help="marca los centros de Alta (A) y Baja (B) presion "
+                         "(usar --centros para activarlos, --no-centros para no)")
     ap.add_argument("--region", choices=list(REGIONS), default=None,
                     help="region predefinida (ver lista abajo). Tiene prioridad sobre --extent")
     ap.add_argument("--extent", nargs=4, type=float, default=None,
@@ -551,14 +623,15 @@ def main():
     print(f"[info] {len(stations)} estaciones en catalogo, "
           f"{len(weather)} observaciones en {weather_path}")
     print(f"[info] region={region_name}  extent={extent}  density={density}  "
-          f"isobaras={args.isobaras}")
+          f"isobaras={args.isobaras}  centros={args.centros}")
 
     df = build_dataframe(weather, stations)
 
     dt = args.datetime or derive_datetime(weather_path, weather)
     out = args.out or f"observaciones_{region_name}_{dt}.png"
     make_plot(df, tuple(extent), dt, out, density_deg=density,
-              isobaras=args.isobaras, iso_step=args.paso_isobaras)
+              isobaras=args.isobaras, iso_step=args.paso_isobaras,
+              centros=args.centros)
 
 
 if __name__ == "__main__":
