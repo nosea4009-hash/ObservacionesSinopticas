@@ -41,6 +41,25 @@ from metpy.calc import reduce_point_density
 
 
 # --------------------------------------------------------------------------- #
+# Lista de Regiones  (extent = LON_MIN, LON_MAX, LAT_MIN, LAT_MAX)
+# Usar con:  python plot_observaciones.py --region nea
+# --------------------------------------------------------------------------- #
+REGIONS = {
+    "region_nea":          (-63.5, -53.0, -31.5, -21.5),  # NEA: Misiones, Corrientes, Chaco, Formosa
+    "region_noa":          (-68.5, -61.0, -32.0, -21.0),  # NOA: Jujuy, Salta, Tucuman, Catamarca, La Rioja, Sgo. del Estero
+    "region_cuyo":         (-71.0, -64.5, -37.5, -28.0),  # Cuyo: Mendoza, San Juan, San Luis
+    "region_pampas":       (-66.0, -56.0, -41.0, -29.0),  # Region Pampeana: Bs. As., La Pampa, Cordoba, Santa Fe, Entre Rios
+    "region_centro":       (-66.0, -57.5, -35.5, -28.0),  # Centro: Cordoba, Santa Fe, Entre Rios
+    "region_litoral":      (-63.0, -53.0, -34.5, -22.0),  # Litoral fluvial: Entre Rios, Corrientes, Misiones, Chaco, Formosa, Santa Fe
+    "region_patagonia":    (-74.0, -62.0, -55.5, -38.0),  # Patagonia: Neuquen, Rio Negro, Chubut, Santa Cruz, Tierra del Fuego
+    "region_buenos_aires": (-63.5, -56.5, -41.5, -33.0),  # Provincia de Buenos Aires
+    "region_argentina":    (-74.0, -52.0, -56.0, -21.0),  # Todo el pais
+    "region_norte_brasil": (-71.0, -47.0, -36.0, -19.0),  # Norte de Argentina + sur de Brasil (vista por defecto)
+}
+DEFAULT_REGION = "region_norte_brasil"
+
+
+# --------------------------------------------------------------------------- #
 # Fuente Arial (Liberation Sans es metricamente identica y libre)
 # --------------------------------------------------------------------------- #
 def setup_font():
@@ -395,21 +414,47 @@ def derive_datetime(weather_path: str, weather: pd.DataFrame) -> str:
 
 # --------------------------------------------------------------------------- #
 def main():
-    ap = argparse.ArgumentParser(description=__doc__)
+    ap = argparse.ArgumentParser(
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="Regiones disponibles (--region):\n  "
+               + "\n  ".join(f"{name:22s} {ext}" for name, ext in REGIONS.items()),
+    )
     ap.add_argument("--stations", default="estaciones_smn.txt")
     ap.add_argument("--weather", default=None,
                     help="archivo estado_tiempo*.txt (por defecto el mas reciente)")
-    ap.add_argument("--extent", nargs=4, type=float,
-                    default=[-71, -47, -36, -19],
+    ap.add_argument("--region", choices=list(REGIONS), default=None,
+                    help="region predefinida (ver lista abajo). Tiene prioridad sobre --extent")
+    ap.add_argument("--extent", nargs=4, type=float, default=None,
                     metavar=("LON_MIN", "LON_MAX", "LAT_MIN", "LAT_MAX"),
-                    help="region: norte de Argentina y sur de Brasil por defecto")
+                    help="region manual; si no se indica region ni extent se usa "
+                         + DEFAULT_REGION)
     ap.add_argument("--datetime", default=None, help="YYYYMMDDHH para el titulo")
-    ap.add_argument("--density", type=float, default=0.5,
-                    help="radio (grados) para reducir solape de estaciones")
+    ap.add_argument("--density", type=float, default=None,
+                    help="radio (grados) para reducir solape; por defecto se ajusta "
+                         "automaticamente al tamano de la region")
     ap.add_argument("--out", default=None)
     args = ap.parse_args()
 
     setup_font()
+
+    # --- resolver region ---
+    if args.region:
+        extent = REGIONS[args.region]
+        region_name = args.region
+    elif args.extent:
+        extent = tuple(args.extent)
+        region_name = "custom"
+    else:
+        extent = REGIONS[DEFAULT_REGION]
+        region_name = DEFAULT_REGION
+
+    # --- densidad automatica segun el ancho de la region ---
+    if args.density is not None:
+        density = args.density
+    else:
+        lon_span = abs(extent[1] - extent[0])
+        density = max(0.08, round(lon_span / 48.0, 2))
 
     weather_path = args.weather
     if weather_path is None:
@@ -422,12 +467,13 @@ def main():
     weather = parse_weather(weather_path)
     print(f"[info] {len(stations)} estaciones en catalogo, "
           f"{len(weather)} observaciones en {weather_path}")
+    print(f"[info] region={region_name}  extent={extent}  density={density}")
 
     df = build_dataframe(weather, stations)
 
     dt = args.datetime or derive_datetime(weather_path, weather)
-    out = args.out or f"observaciones_{dt}.png"
-    make_plot(df, tuple(args.extent), dt, out, density_deg=args.density)
+    out = args.out or f"observaciones_{region_name}_{dt}.png"
+    make_plot(df, tuple(extent), dt, out, density_deg=density)
 
 
 if __name__ == "__main__":
